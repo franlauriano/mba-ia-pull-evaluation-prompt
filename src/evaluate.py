@@ -20,13 +20,15 @@ Configure o provider no arquivo .env através da variável LLM_PROVIDER.
 import os
 import sys
 import json
-from typing import List, Dict, Any
+import time
+import yaml
+from typing import List, Dict, Any, Optional
 from pathlib import Path
 from dotenv import load_dotenv
 from langsmith import Client
 from langchain import hub
 from langchain_core.prompts import ChatPromptTemplate
-from utils import check_env_vars, format_score, print_section_header, get_llm as get_configured_llm
+from utils import check_env_vars, format_score, print_section_header, get_llm as get_configured_llm, load_yaml
 from metrics import evaluate_f1_score, evaluate_clarity, evaluate_precision
 
 load_dotenv()
@@ -34,6 +36,17 @@ load_dotenv()
 
 def get_llm():
     return get_configured_llm(temperature=0)
+
+
+def _rate_limit_sleep():
+    """
+    Respeita limite de requisições por minuto (ex.: Gemini 30 RPM).
+    EVAL_RATE_LIMIT_DELAY_SECONDS: delay em segundos entre cada chamada ao LLM.
+    Para 30 RPM use 2 (60/30). Padrão 0 (sem delay).
+    """
+    delay = float(os.getenv("EVAL_RATE_LIMIT_DELAY_SECONDS", "0"))
+    if delay > 0:
+        time.sleep(delay)
 
 
 def load_dataset_from_jsonl(jsonl_path: str) -> List[Dict[str, Any]]:
@@ -140,6 +153,33 @@ def pull_prompt_from_langsmith(prompt_name: str) -> ChatPromptTemplate:
         raise
 
 
+def load_prompt_from_local_yaml(base_dir: Path, file_path: str, prompt_key: str) -> ChatPromptTemplate:
+    """
+    Carrega um prompt a partir de um arquivo YAML local (ex.: prompts/bug_to_user_story_v1.yml).
+    Útil para avaliar o v1 sem precisar publicá-lo no LangSmith Hub.
+    """
+    full_path = base_dir / file_path
+    if not full_path.exists():
+        raise FileNotFoundError(f"Arquivo não encontrado: {full_path}")
+    data = load_yaml(str(full_path))
+    if not data:
+        raise ValueError(f"Não foi possível carregar o YAML: {file_path}")
+    if prompt_key not in data:
+        raise KeyError(f"Chave '{prompt_key}' não encontrada no YAML. Chaves: {list(data.keys())}")
+    prompt_data = data[prompt_key]
+    # Aceitar tanto objeto (v2) quanto string com YAML embutido (v1 com "key: |")
+    if isinstance(prompt_data, str):
+        prompt_data = yaml.safe_load(prompt_data) or {}
+    if not isinstance(prompt_data, dict):
+        raise ValueError(f"Valor da chave '{prompt_key}' deve ser um objeto ou YAML em string, obtido: {type(prompt_data).__name__}")
+    system_prompt = prompt_data.get("system_prompt", "")
+    user_prompt = prompt_data.get("user_prompt", "{bug_report}")
+    return ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        ("human", user_prompt),
+    ])
+
+
 def evaluate_prompt_on_example(
     prompt_template: ChatPromptTemplate,
     example: Any,
@@ -181,12 +221,16 @@ def evaluate_prompt_on_example(
 def evaluate_prompt(
     prompt_name: str,
     dataset_name: str,
-    client: Client
+    client: Client,
+    prompt_template: Optional[ChatPromptTemplate] = None,
 ) -> Dict[str, float]:
     print(f"\n🔍 Avaliando: {prompt_name}")
 
     try:
-        prompt_template = pull_prompt_from_langsmith(prompt_name)
+        if prompt_template is None:
+            prompt_template = pull_prompt_from_langsmith(prompt_name)
+        else:
+            print(f"   Usando prompt carregado do arquivo local.")
 
         examples = list(client.list_examples(dataset_name=dataset_name))
         print(f"   Dataset: {len(examples)} exemplos")
@@ -199,19 +243,28 @@ def evaluate_prompt(
 
         print("   Avaliando exemplos...")
 
-        for i, example in enumerate(examples[:10], 1):
+        rate_limit_delay = float(os.getenv("EVAL_RATE_LIMIT_DELAY_SECONDS", "0"))
+        if rate_limit_delay > 0:
+            print(f"   Rate limit: {rate_limit_delay}s entre chamadas ao LLM (EVAL_RATE_LIMIT_DELAY_SECONDS)")
+
+        examples_to_run = 10
+        for i, example in enumerate(examples[:examples_to_run], 1):
             result = evaluate_prompt_on_example(prompt_template, example, llm)
+            _rate_limit_sleep()
 
             if result["answer"]:
                 f1 = evaluate_f1_score(result["question"], result["answer"], result["reference"])
+                _rate_limit_sleep()
                 clarity = evaluate_clarity(result["question"], result["answer"], result["reference"])
+                _rate_limit_sleep()
                 precision = evaluate_precision(result["question"], result["answer"], result["reference"])
+                _rate_limit_sleep()
 
                 f1_scores.append(f1["score"])
                 clarity_scores.append(clarity["score"])
                 precision_scores.append(precision["score"])
 
-                print(f"      [{i}/{min(10, len(examples))}] F1:{f1['score']:.2f} Clarity:{clarity['score']:.2f} Precision:{precision['score']:.2f}")
+                print(f"      [{i}/{examples_to_run}] F1:{f1['score']:.2f} Clarity:{clarity['score']:.2f} Precision:{precision['score']:.2f}")
 
         avg_f1 = sum(f1_scores) / len(f1_scores) if f1_scores else 0.0
         avg_clarity = sum(clarity_scores) / len(clarity_scores) if clarity_scores else 0.0
@@ -306,23 +359,53 @@ def main():
     print("\n" + "=" * 70)
     print("PROMPTS PARA AVALIAR")
     print("=" * 70)
-    print("\nEste script irá puxar prompts do LangSmith Hub.")
-    print("Certifique-se de ter feito push dos prompts antes de avaliar:")
-    print("  python src/push_prompts.py\n")
+    print("\nPrompts podem vir do LangSmith Hub (EVAL_PROMPT_LANGSMITH) ou de arquivo local (EVAL_PROMPT_LOCAL_FILE).")
+    print("Se nenhuma env estiver preenchida, usa v2 do Hub por padrão.\n")
 
-    prompts_to_evaluate = [
-        "bug_to_user_story_v2",
-    ]
+    base_dir = Path(__file__).resolve().parent.parent
+
+    langsmith_path = (os.getenv("EVAL_PROMPT_LANGSMITH") or "").strip()
+    local_file = (os.getenv("EVAL_PROMPT_LOCAL_FILE") or "").strip()
+    local_key = (os.getenv("EVAL_PROMPT_LOCAL_KEY") or "").strip()
+
+    prompts_to_evaluate = []
+    if langsmith_path:
+        prompts_to_evaluate.append(langsmith_path)
+    if local_file:
+        key = local_key if local_key else Path(local_file).stem
+        prompts_to_evaluate.append({"source": "local", "file": local_file, "key": key})
+
+    if not prompts_to_evaluate:
+        prompts_to_evaluate = [
+            "bug_to_user_story_v2",
+        ]
 
     all_passed = True
     evaluated_count = 0
     results_summary = []
 
-    for prompt_name in prompts_to_evaluate:
+    for spec in prompts_to_evaluate:
+        if isinstance(spec, str):
+            prompt_name = spec
+            prompt_template = None
+        else:
+            prompt_name = spec["key"]
+            try:
+                prompt_template = load_prompt_from_local_yaml(base_dir, spec["file"], spec["key"])
+            except Exception as e:
+                print(f"\n❌ Falha ao carregar prompt local '{prompt_name}': {e}")
+                all_passed = False
+                results_summary.append({
+                    "prompt": prompt_name,
+                    "scores": {"helpfulness": 0.0, "correctness": 0.0, "f1_score": 0.0, "clarity": 0.0, "precision": 0.0},
+                    "passed": False,
+                })
+                continue
+
         evaluated_count += 1
 
         try:
-            scores = evaluate_prompt(prompt_name, dataset_name, client)
+            scores = evaluate_prompt(prompt_name, dataset_name, client, prompt_template=prompt_template)
 
             passed = display_results(prompt_name, scores)
             all_passed = all_passed and passed
